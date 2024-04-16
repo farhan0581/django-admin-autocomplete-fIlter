@@ -1,4 +1,9 @@
-from django.contrib.admin.widgets import AutocompleteSelect as Base
+from django.contrib.admin.widgets import (
+  AutocompleteSelect as AutocompleteSelectBase,
+)
+from django.contrib.admin.widgets import (
+    AutocompleteSelectMultiple as AutocompleteSelectMultipleBase,
+)
 from django import forms
 from django.contrib import admin
 from django.db.models.fields.related import ForeignObjectRel
@@ -8,16 +13,27 @@ from django.forms.widgets import Media, MEDIA_TYPES, media_property
 from django.shortcuts import reverse
 from django import VERSION as DJANGO_VERSION
 
-class AutocompleteSelect(Base):
+
+class AutocompleteSelectMixin:
     def __init__(self, rel, admin_site, attrs=None, choices=(), using=None, custom_url=None):
         self.custom_url = custom_url
         super().__init__(rel, admin_site, attrs, choices, using)
-    
+
     def get_url(self):
         return self.custom_url if self.custom_url else super().get_url()
 
 
-class AutocompleteFilter(admin.SimpleListFilter):
+class AutocompleteSelect(AutocompleteSelectMixin, AutocompleteSelectBase):
+    pass
+
+
+class AutocompleteSelectMultiple(
+    AutocompleteSelectMixin, AutocompleteSelectMultipleBase
+):
+    pass
+
+
+class AutocompleteFilterBase(admin.SimpleListFilter):
     template = 'django-admin-autocomplete-filter/autocomplete-filter.html'
     title = ''
     field_name = ''
@@ -27,7 +43,8 @@ class AutocompleteFilter(admin.SimpleListFilter):
     widget_attrs = {}
     rel_model = None
     parameter_name = None
-    form_field = forms.ModelChoiceField
+    form_field = None
+    widget_cls = None
 
     class Media:
         js = (
@@ -42,9 +59,7 @@ class AutocompleteFilter(admin.SimpleListFilter):
 
     def __init__(self, request, params, model, model_admin):
         if self.parameter_name is None:
-            self.parameter_name = self.field_name
-            if self.use_pk_exact:
-                self.parameter_name += '__{}__exact'.format(self.field_pk)
+            self.parameter_name = self.generate_parameter_name()
         super().__init__(request, params, model, model_admin)
 
         if self.rel_model:
@@ -55,10 +70,14 @@ class AutocompleteFilter(admin.SimpleListFilter):
         else:
             remote_field = model._meta.get_field(self.field_name).remote_field
 
-        widget = AutocompleteSelect(remote_field,
-                                    model_admin.admin_site,
-                                    custom_url=self.get_autocomplete_url(request, model_admin),)
+        assert self.widget_cls is not None, 'widget_cls must be defined'
+        widget = self.widget_cls(
+            remote_field,
+            model_admin.admin_site,
+            custom_url=self.get_autocomplete_url(request, model_admin),
+        )
         form_field = self.get_form_field()
+        assert form_field is not None, 'form_field or get_form_field() must be defined'
         field = form_field(
             queryset=self.get_queryset_for_field(model, self.field_name),
             widget=widget,
@@ -72,9 +91,12 @@ class AutocompleteFilter(admin.SimpleListFilter):
         if self.is_placeholder_title:
             # Upper case letter P as dirty hack for bypass django2 widget force placeholder value as empty string ("")
             attrs['data-Placeholder'] = self.title
+        value = self.used_parameters.get(self.parameter_name, "")
+        if value:
+            value = self.normalize_value(value)
         self.rendered_widget = field.widget.render(
             name=self.parameter_name,
-            value=self.used_parameters.get(self.parameter_name, ''),
+            value=value,
             attrs=attrs
         )
 
@@ -111,7 +133,7 @@ class AutocompleteFilter(admin.SimpleListFilter):
         def _get_media(obj):
             return Media(media=getattr(obj, 'Media', None))
 
-        media = _get_media(model_admin) + widget.media + _get_media(AutocompleteFilter) + _get_media(self)
+        media = _get_media(model_admin) + widget.media + _get_media(AutocompleteFilterBase) + _get_media(self)
 
         for name in MEDIA_TYPES:
             setattr(model_admin.Media, name, getattr(media, "_" + name))
@@ -122,18 +144,53 @@ class AutocompleteFilter(admin.SimpleListFilter):
     def lookups(self, request, model_admin):
         return ()
 
+    def generate_parameter_name(self):
+        return self.field_name
+
+    @classmethod
+    def normalize_value(cls, value):
+        return value
+
     def queryset(self, request, queryset):
-        if self.value():
-            return queryset.filter(**{self.parameter_name: self.value()})
+        value = self.value()
+        if value:
+            return queryset.filter(**{self.parameter_name: self.normalize_value(value)})
         else:
             return queryset
-    
+
     def get_autocomplete_url(self, request, model_admin):
         '''
             Hook to specify your custom view for autocomplete,
             instead of default django admin's search_results.
         '''
         return None
+
+
+class AutocompleteFilter(AutocompleteFilterBase):
+    form_field = forms.ModelChoiceField
+    widget_cls = AutocompleteSelect
+
+    def generate_parameter_name(self):
+        parameter_name = super().generate_parameter_name()
+        if self.use_pk_exact:
+            parameter_name += '__{}__exact'.format(self.field_pk)
+        return parameter_name
+
+
+class AutocompleteFilterMultiple(AutocompleteFilterBase):
+    form_field = forms.ModelMultipleChoiceField
+    widget_cls = AutocompleteSelectMultiple
+
+    def generate_parameter_name(self):
+        parameter_name = super().generate_parameter_name()
+        if self.use_pk_exact:
+            parameter_name += "__{}".format(self.field_pk)
+        parameter_name += "__in"
+        return parameter_name
+
+    @classmethod
+    def normalize_value(cls, value):
+        return value.split(",")
 
 
 def generate_choice_field(label_item):
